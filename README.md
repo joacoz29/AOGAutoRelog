@@ -63,6 +63,29 @@ Se guarda en `config.json` (se crea al usar la pestaña *Ajustes*; `config.examp
 
 Todo queda local, en `datos/`: `cortes.jsonl`, `latencia.csv`, `sesiones.jsonl`, `juego.jsonl`. Los informes se guardan en `informes/`. Ninguno de estos archivos está en el repositorio.
 
+## Documentación
+
+| Documento | Contenido |
+|---|---|
+| [Arquitectura](docs/ARQUITECTURA.md) | Diagramas de componentes, hilos y flujo; decisiones de diseño |
+| [Cómo funciona](docs/FUNCIONAMIENTO.md) | Reconocimiento de pantallas, flujo del relog, envío de entrada, Angel Baby, juego minimizado |
+| [Monitor de internet y datos](docs/DATOS.md) | Cómo se mide un corte, formato de los archivos, estadísticas e informe |
+| [Configuración](docs/CONFIGURACION.md) | Todas las opciones de `config.json` |
+| [Guía de desarrollo](docs/DESARROLLO.md) | Entorno, plantillas, cómo agregar pantallas y trampas conocidas |
+
+## Arquitectura en una imagen
+
+```mermaid
+flowchart LR
+    GUI["gui.py<br/>interfaz"] --> ENG["autorelog.py<br/>motor del relog"]
+    GUI --> NET["netmon.py<br/>monitor de internet"]
+    GUI --> TRY["tray.py<br/>bandeja"]
+    ENG -- "captura + mensajes de entrada" --> GAME["Angels Online<br/>angel.dat"]
+    NET -- "TCP 1/s" --> INET(("Internet"))
+    NET --> DATA[("datos/")]
+    NET -- "fin de un corte" --> GUI
+```
+
 ## Estructura
 
 | Archivo | Qué es |
