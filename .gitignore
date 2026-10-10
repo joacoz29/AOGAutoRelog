@@ -1,0 +1,19 @@
+# entorno y cache
+.venv/
+__pycache__/
+*.pyc
+
+# datos locales de quien lo usa (mediciones, informes, registros, estado, configuracion personal)
+datos/
+informes/
+*.log
+*.log.*
+state.json
+config.json
+config.json.bak
+*.tmp
+
+# se generan solos al ejecutar
+icon_*.ico
+fallo_*.png
+crop.py
