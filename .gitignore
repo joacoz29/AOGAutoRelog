@@ -17,3 +17,4 @@ config.json.bak
 icon_*.ico
 fallo_*.png
 crop.py
+capturas/

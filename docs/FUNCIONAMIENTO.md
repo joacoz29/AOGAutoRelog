@@ -10,8 +10,19 @@ Se combinan dos señales:
 
 | Escala | Cuándo |
 |---|---|
-| `[1.0]` | La ventana mide exactamente 1366×768 (lo normal): reconocer cuesta ~50–150 ms. |
-| 11 escalas (0.7–1.3) | Cualquier otro tamaño: funciona, pero tarda ~10 veces más. |
+| `[1.0]` | Siempre por defecto. El juego dibuja su interfaz **1:1 en cualquier resolución** (cambia el tamaño de la ventana, no el de los botones), así que no hace falta escalar. Reconocer una pantalla cuesta ~50–400 ms según el tamaño de la captura. |
+| 11 escalas (0.7–1.3) | Solo si durante ~4 s no se reconoce nada fuera del mundo y una búsqueda única con escalas encuentra la interfaz a otra escala (por ejemplo un modo que estira la imagen). Se activa para el resto de la sesión y queda en el registro. |
+
+### Estilos de dibujo del juego
+
+El texto del cliente se dibuja con **dos estilos** según la configuración del juego:
+
+| Estilo | Cómo se ve | Plantillas |
+|---|---|---|
+| `sd` | El original: letras más gruesas, con sombra. | `templates/<nombre>.png` |
+| `hd` | Con el *Render Fix* de BetterAngels (que parchea el ejecutable): trazos finos y nítidos. | `templates/hd/<nombre>.png` |
+
+Cada plantilla puede tener las dos versiones. `find()` prueba primero el estilo que coincidió la última vez y, si no hay coincidencia, el otro; el resultado lleva `v` (`sd`/`hd`). Las **distancias** a botones y casillas también dependen del estilo: el panel del Angel Baby, por ejemplo, es más compacto en `hd` (`AB_LAYOUT`) y sus posiciones son otras. Hoy `hd` cubre **todo el flujo**: cartel de desconexión, *Select Server*, *Select Channel* (filas a 19 px), aviso de PIN, anuncio, selección de personaje (*Enter Game*), aviso de Trade PIN y el panel del Angel Baby. Las plantillas `hd` de PIN, anuncio, personaje y Trade PIN se armaron con capturas de pantalla completa del juego (1920×1032).
 
 ## 2. Reglas de reconocimiento
 
@@ -30,6 +41,8 @@ Se evalúan **en este orden**; la primera que coincide gana. Cada una tiene un *
 Dentro del mundo solo se evalúan las reglas 1 y 3 (más barato y sin falsos positivos).
 
 La regla `channel` no busca un botón: calcula la fila a partir de la cabecera (`CHANNEL_ROW0 = (108, 29)`, separación `20.25` px por canal) y el botón ✔ a `(136, 299)`; antes de aceptar vuelve a buscar el ✔ por imagen.
+
+**Antes de aceptar se verifica que la fila quedó elegida.** La fila marcada se ve con fondo rojizo (el rojo supera claramente al azul; las demás son verde azulado), así que tras cada click se mide el color de las 5 filas. Si no quedó marcada la deseada, reintenta hasta 3 veces; si no lo logra, **no confirma** (aceptar sin elegir entraría al canal que viene marcado por defecto, normalmente el 1, que suele estar lleno). Al entrar al mundo compara el canal del título con el elegido y, si difiere, lo avisa en el registro y **no lo guarda como canal preferido**.
 
 ## 3. El flujo completo
 
@@ -58,7 +71,8 @@ stateDiagram-v2
 Detalles que importan:
 
 - **No actúa sin internet.** Antes de cada click comprueba conexión (`online()`); si no hay, espera. Así no malgasta intentos contra una pantalla que no puede avanzar.
-- **No repite un click demasiado pronto.** `MIN_REPEAT`: `server` 3.5 s, `channel` 3 s, `character` 3.5 s, `disconnect` 2 s, el resto 1.5 s.
+- **No repite un click demasiado pronto.** `MIN_REPEAT`: `server` 3 s, `channel` 4 s, `character` 4.5 s, `disconnect` 3 s, `pin` 2.5 s, `announcement` 2.5 s, el resto 1.5 s. Solo se repite si la pantalla **sigue siendo la misma**; si ya cambió, se pasa a la siguiente.
+- **Reintento rápido del click de *Start*.** Ese click, medido en `autorelog.log`, se pierde a menudo justo cuando aparece la pantalla. Tras clickearlo, a los `server_early_probe` (1 s) se compara la captura con la que había **justo antes** del click: si es idéntica, el click no registró y se reintenta de inmediato (sin esperar los 3 s de `MIN_REPEAT`, que costaban ~3 s de más). Si en cambio hay cualquier diferencia (aunque sea mínima), la pantalla está **cargando** (tras un *Start* exitoso el juego tarda ~2.4 s en mostrar *Select Channel*) y se deja pasar. El reintento escala al método de click del motor (fondo → fondo largo → mouse real) y se re-arma por si se pierde de nuevo. Con esto, un *Start* perdido suma ~1 s en vez de ~3.7 s.
 - **Freno de seguridad.** Si una misma regla se acciona `max_attempts` veces (8) en 60 s sin avanzar, pausa 60 s.
 - **El "reingreso" solo cuenta tras haber pasado por el login**, porque al cerrar el cartel el título sigue "en el mundo" un instante.
 
@@ -91,14 +105,14 @@ Las teclas (`Ctrl+R`) siguen el mismo esquema: `Ctrl` abajo → `R` abajo (0.3 s
 
 ```mermaid
 flowchart LR
-    A["Mismo paso, intento 1"] -->|"no avanza en < 20 s"| B["intento 2"]
-    B -->|"no avanza"| C["intento 3 en adelante"]
-    A --- A1["nivel 0 · fondo<br/>pulsacion 0.1 s"]
-    B --- B1["nivel 1 · fondo largo<br/>3 movimientos + pulsacion 0.4 s"]
-    C --- C1["nivel 2 · mouse real<br/>(si fallback_real_mouse)"]
+    A["Mismo paso, intento 1"] -->|"no avanza"| B["intento 2"]
+    B -->|"no avanza en < 20 s"| C["intento 3 en adelante"]
+    A --- A1["fondo largo<br/>3 movimientos + pulsacion 0.4 s"]
+    B --- B1["fondo largo"]
+    C --- C1["mouse real<br/>(si fallback_real_mouse)"]
 ```
 
-El nivel se calcula contando cuántas veces se accionó **esa regla** en los últimos 20 s. El mouse real trae el juego al frente un instante y después devuelve el foco y la posición del cursor.
+Se cuenta cuántas veces se accionó **esa regla** en los últimos 20 s. **Se empieza por el click largo** porque, medido en el registro de varias relogueadas, el click corto (pulsación de 0.1 s) nunca registró en carteles ni en el login: siempre hacía falta el segundo intento, lo que costaba ~4 s por pantalla. El click corto se sigue usando dentro del panel del Angel Baby, donde sí funciona. El mouse real trae el juego al frente un instante y después devuelve el foco y la posición del cursor.
 
 ## 5. Angel Baby
 
@@ -129,11 +143,22 @@ sequenceDiagram
     R->>G: ShowWindow(SW_SHOWNOACTIVATE)  (sin foco)
     Note over R: espera 1.5 s a que dibuje
     R->>G: captura → ¿cartel? → relog completo → Angel Baby
-    Note over R: todo en orden ≥ 5 s despues
+    Note over R: todo en orden y pasaron peek_dwell_s (45 s)
     R->>G: ShowWindow(SW_SHOWMINNOACTIVE)
 ```
 
-También hay una revisión periódica (`peek_every_min`, 10 por defecto) para casos que el monitor de internet no ve, como una caída del servidor del juego con tu conexión bien.
+Cuándo se restaura el juego minimizado (cualquiera de estas):
+
+| Disparador | Cuándo | Cuánto se queda restaurado |
+|---|---|---|
+| **Corte largo en curso** | El internet lleva `peek_during_outage_s` (45 s) caído. Así el programa ve el cartel apenas aparece y reloguea en el instante en que vuelve la conexión, sin depender de un solo aviso. | Todo el corte, y `peek_dwell_s` (45 s) después de que vuelva. |
+| **Volvió internet** | Tras un corte de al menos `peek_min_outage` (3 s). | `peek_dwell_s` (45 s). |
+| **Seguimiento** | A +60 s y +180 s de un corte de 30 s o más. | `peek_dwell_s` (45 s). |
+| **Revisión periódica** | Cada `peek_every_min` (10 min) si sigue minimizado: cubre lo que el monitor de internet no ve, como una caída del servidor del juego con tu conexión bien. | 6 s. |
+
+**Por qué se queda 45 s y no unos segundos.** El cliente puede mostrar el cartel de desconexión *después* de que vuelve internet: en un corte real se vio aparecer 6 s más tarde. Si se lo vuelve a minimizar antes, el cartel pasa desapercibido hasta la próxima revisión periódica y parece que "no vuelve a conectar". Con el juego visible esto no pasa porque el programa sigue mirando.
+
+Al restaurar, se comprueba que la captura no sea un cuadro vacío (el juego puede tardar en dibujar): se espera hasta 12 s y, si sigue vacía, se avisa y el juego se deja abierto para que lo veas. Cada decisión de este camino queda en el registro, incluida la de **no** revisar cuando la vigilancia está detenida.
 
 Reglas para no estorbar:
 

@@ -31,6 +31,7 @@ import win32gui
 import win32process
 import win32ui
 
+import expmon
 import netmon
 
 ctypes.windll.user32.SetProcessDPIAware()
@@ -49,6 +50,8 @@ DEFAULTS = {
     "max_attempts": 8,
     "default_channel": 4,
     "threshold": 0.8,
+    "server_early_retry": False,  # reintentar Start apenas la pantalla sigue identica (EXPERIMENTAL: hace clicks de mas si el servidor tarda con la pantalla quieta; por ahora solo mide)
+    "server_early_probe": 1.0,  # s tras clickear Start antes de mirar si la pantalla cambio (carga); si no cambio, reintenta sin esperar el MIN_REPEAT
     "dismiss_trade_pin": True,
     "channel_fixed": 0,    # 0 = recordar el ultimo canal
     "autostart": True,     # la interfaz empieza a vigilar al abrirse
@@ -57,7 +60,13 @@ DEFAULTS = {
     "start_in_tray": False,          # arrancar sin mostrar la ventana
     "restore_minimized": True,       # si el juego esta minimizado, restaurarlo (sin foco) cuando haga falta revisarlo
     "peek_min_outage": 3,            # segundos de corte de internet a partir de los cuales se revisa el juego
+    "peek_during_outage_s": 45,      # si el internet lleva tanto caido y el juego esta minimizado, restaurarlo ya (0 = no)
+    "outage_front": True,            # al cortarse el internet: dejar el juego abierto AL FRENTE (False = de fondo, detras de las demas ventanas)
+    "peek_dwell_s": 45,              # tras un corte, cuanto dejarlo restaurado mirando antes de volver a minimizarlo
     "peek_every_min": 10,            # ademas, revisarlo cada tantos minutos si sigue minimizado (0 = nunca)
+    "exp_tracking": True,            # leer la experiencia del HUD y calcular el ritmo por hora
+    "exp_stall_min": 10,             # avisar si pasan estos minutos sin ganar experiencia (0 = nunca)
+    "capture_unknown": True,         # guardar en capturas/ las pantallas del login no reconocidas (para armar plantillas)
     "isp": "",                       # nombre del proveedor (aparece en el informe de conexion)
     "fallback_real_mouse": True,     # si un paso falla 2 veces en segundo plano, ese click va con el mouse real
     "angel_baby_after_relog": True,  # al volver al mundo: Ctrl+R y tildar Attack
@@ -67,9 +76,11 @@ DEFAULTS = {
     "title_prefix": "Angels Online Global",
 }
 SCALES = [1.0, 0.95, 1.05, 0.9, 1.1, 0.85, 1.15, 0.8, 1.2, 1.3, 0.7]
-ACTIVE_SCALES = SCALES   # se reduce a [1.0] cuando la ventana mide 1366x768 (mucho mas rapido)
-BASE_SIZE = (768, 1366)
-MIN_REPEAT = {"server": 3.5, "channel": 3.0, "character": 3.5, "disconnect": 2.0}  # s antes de repetir el mismo click
+ACTIVE_SCALES = [1.0]    # el juego dibuja su interfaz 1:1 en cualquier resolucion: buscar a escala 1 es ~10 veces mas rapido
+WIDE_SCALES = False      # se activa si la interfaz aparece escalada (p. ej. un modo que estira la imagen)
+# s antes de repetir el mismo click: el servidor tarda 2-4 s en responder y el mundo en cargar; repetir antes solo suma clicks de mas
+# (el click de Start a veces se pierde justo cuando la pantalla aparece: se reintenta rapido; lo que ya cambio de pantalla no se repite)
+MIN_REPEAT = {"server": 3.0, "channel": 4.0, "character": 4.5, "disconnect": 3.0, "connfail": 3.0, "pin": 2.5, "announcement": 2.5}
 TITLE_RE = re.compile(r"\((?P<server>[^()-]+)-(?P<ch>\d+)\)\s*$")
 
 # Reglas en orden de prioridad. marker: texto que identifica la pantalla/cartel;
@@ -79,21 +90,26 @@ RULES = [
     dict(name="pin", marker="pin_text", button="ok_btn"),
     dict(name="tradepin", marker="tradepin_text", button="tradepin_no", world=True, opt="dismiss_trade_pin"),
     dict(name="announcement", marker=None, button="confirm_btn"),
+    dict(name="connfail", marker="fail_text", button="ok_btn"),   # "Failed to connect to server." (servidor caido / mantenimiento)
     dict(name="server", marker="server_hdr", button="start_btn"),
     dict(name="channel", marker="channel_hdr", button="chan_ok"),
     dict(name="character", marker=None, button="enter_btn"),
 ]
 
 # Offsets medidos en capturas a escala 1:1, relativos a la esquina sup-izq del recorte
-CHANNEL_ROW0 = (108, 29)   # centro de la fila Athena(1) respecto de channel_hdr
-CHANNEL_PITCH = 20.25
-CHANNEL_OK = (136, 299)    # centro del boton aceptar respecto de channel_hdr
+# Distancias medidas por estilo de dibujo ("sd" viejo / "hd" Render Fix): fila Athena(1) y boton aceptar respecto de la
+# esquina de channel_hdr. En "hd" la lista es mas compacta (19 px por fila en vez de 20.25).
+CHANNEL_LAYOUT = {
+    "sd": dict(row0=(108, 29), pitch=20.25, ok=(136, 299)),
+    "hd": dict(row0=(92, 28), pitch=19.0, ok=(120, 280)),
+}
 
 # Panel del Angel Baby: offsets desde la esquina sup-izq de la plantilla "ab_enable" (texto Enable Angel Baby)
-AB_COMBAT_TAB = (5, -14)
-AB_ATTACK_BOX = (-9, -469)
-AB_ENABLE_BOX = (-9, 9)
-AB_CLOSE_BTN = (396, 9)
+AB_LAYOUT = {
+    "sd": dict(tab=(5, -14), attack=(-9, -469), enable=(-9, 9), close=(396, 9)),
+    "hd": dict(tab=(9, -16), attack=(-8, -442), enable=(-8, 7), close=(372, 6)),   # el panel es mas compacto en este estilo
+}
+AB_TABS_TO_ENABLE = {"sd": (-39, 24), "hd": (-37, 24)}   # de la esquina de ab_tabs a la de ab_enable
 
 log = logging.getLogger("autorelog")
 
@@ -148,37 +164,50 @@ def file_handler():
 
 
 _tpl_cache = {}
+PREFERRED = ["sd"]   # estilo de plantillas que coincidio la ultima vez: se prueba primero
 
 
-def template(name):
+def variants(name):
+    """[(estilo, imagen)]: templates/<n>.png ('sd', estilo viejo) y templates/hd/<n>.png ('hd', texto nitido del Render Fix)."""
     if name not in _tpl_cache:
-        img = cv2.imread(str(TEMPLATES / f"{name}.png"), cv2.IMREAD_GRAYSCALE)
-        if img is None:
+        out = []
+        for v, path in (("sd", TEMPLATES / f"{name}.png"), ("hd", TEMPLATES / "hd" / f"{name}.png")):
+            img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE) if path.exists() else None
+            if img is not None:
+                out.append((v, img))
+        if not out:
             raise FileNotFoundError(TEMPLATES / f"{name}.png")
-        _tpl_cache[name] = img
+        _tpl_cache[name] = out
     return _tpl_cache[name]
 
 
+def template(name):
+    return variants(name)[0][1]
+
+
 def find(gray, name, thr, roi=None):
-    """Mejor coincidencia de la plantilla (multi-escala). Devuelve dict o None."""
+    """Mejor coincidencia de la plantilla (en cualquiera de sus estilos). Devuelve dict (con 'v' = estilo) o None."""
     ox = oy = 0
     if roi:
         x0, y0, x1, y1 = [max(0, int(v)) for v in roi]
         gray = gray[y0:y1, x0:x1]
         ox, oy = x0, y0
-    tpl = template(name)
-    best = None
-    for s in ACTIVE_SCALES:
-        t = tpl if s == 1.0 else cv2.resize(tpl, None, fx=s, fy=s, interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR)
-        if t.shape[0] >= gray.shape[0] or t.shape[1] >= gray.shape[1]:
-            continue
-        res = cv2.matchTemplate(gray, t, cv2.TM_CCOEFF_NORMED)
-        _, score, _, loc = cv2.minMaxLoc(res)
-        if best is None or score > best["score"]:
-            best = dict(score=float(score), x=loc[0] + ox, y=loc[1] + oy, w=t.shape[1], h=t.shape[0], s=s)
-        if score >= 0.95:
-            break
-    return best if best and best["score"] >= thr else None
+    for v, tpl in sorted(variants(name), key=lambda p: p[0] != PREFERRED[0]):
+        best = None
+        for s in ACTIVE_SCALES:
+            t = tpl if s == 1.0 else cv2.resize(tpl, None, fx=s, fy=s, interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR)
+            if t.shape[0] >= gray.shape[0] or t.shape[1] >= gray.shape[1]:
+                continue
+            res = cv2.matchTemplate(gray, t, cv2.TM_CCOEFF_NORMED)
+            _, score, _, loc = cv2.minMaxLoc(res)
+            if best is None or score > best["score"]:
+                best = dict(score=float(score), x=loc[0] + ox, y=loc[1] + oy, w=t.shape[1], h=t.shape[0], s=s, v=v)
+            if score >= 0.95:
+                break
+        if best and best["score"] >= thr:
+            PREFERRED[0] = v
+            return best
+    return None
 
 
 def center(m):
@@ -239,6 +268,8 @@ def grab(hwnd):
     w, h = r - l, b - t
     cx, cy = win32gui.ClientToScreen(hwnd, (0, 0))
     cw, ch = win32gui.GetClientRect(hwnd)[2:]
+    if w <= 0 or h <= 0 or cw <= 0 or ch <= 0 or win32gui.IsIconic(hwnd):
+        return np.zeros((0, 0, 3), np.uint8)   # minimizada justo ahora: no hay nada que capturar
     hdc = win32gui.GetWindowDC(hwnd)
     src = win32ui.CreateDCFromHandle(hdc)
     mem = src.CreateCompatibleDC()
@@ -257,6 +288,28 @@ def grab(hwnd):
 
 
 SW_SHOWNOACTIVATE, SW_SHOWMINNOACTIVE = 4, 7  # restaurar / minimizar sin quitarte el foco
+
+
+def bring_to_front(hwnd):
+    """Restaura (si esta minimizada) y pone la ventana al frente, con foco."""
+    try:
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)   # truco para poder tomar el foco
+        win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
+        win32gui.SetForegroundWindow(hwnd)
+    except Exception as e:  # noqa: BLE001
+        log.warning("no pude poner el juego al frente: %s", e)
+
+
+def send_to_back(hwnd):
+    """Detras de las demas ventanas, sin activarla ni moverla. Capturar con PrintWindow funciona igual aunque este tapada;
+    en pantalla completa sin bordes, restaurarla encima cubriria todo el escritorio."""
+    try:
+        win32gui.SetWindowPos(hwnd, win32con.HWND_BOTTOM, 0, 0, 0, 0,
+                              win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE)
+    except Exception:  # noqa: BLE001
+        pass
 PARK = (900, 30)  # rincon vacio donde dejamos el cursor del juego despues de cada click
 SETTLE = 0.9  # el juego procesa la entrada en su siguiente cuadro; no marcarlo inactivo antes
 
@@ -332,11 +385,18 @@ def bg_keys(hwnd, mods, vk, hold=0.3, sleep=True):
         time.sleep(0.1)
 
 
-def grab_gray(hwnd):
+def grab_pair(hwnd):
+    """(captura en color, captura en gris). Ajusta las escalas de busqueda segun el tamano de la ventana."""
     global ACTIVE_SCALES
     img = grab(hwnd)
-    ACTIVE_SCALES = [1.0] if img.shape[:2] == BASE_SIZE else SCALES
-    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    ACTIVE_SCALES = SCALES if WIDE_SCALES else [1.0]
+    if img.size == 0:
+        return img, np.zeros((1, 1), np.uint8)
+    return img, cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+
+def grab_gray(hwnd):
+    return grab_pair(hwnd)[1]
 
 
 METHODS = ["fondo", "fondo largo", "mouse real"]
@@ -401,8 +461,10 @@ def find_ab(gray, thr):
     if m:
         return m
     t = find(gray, "ab_tabs", 0.75)
-    if t:  # offset medido: ab_tabs (905,630) -> ab_enable (866,654)
-        return dict(score=t["score"], x=t["x"] - 39, y=t["y"] + 24, w=119, h=19, s=1.0)
+    if t:
+        v = t.get("v", "sd")
+        dx, dy = AB_TABS_TO_ENABLE[v]
+        return dict(score=t["score"], x=t["x"] + dx, y=t["y"] + dy, w=119, h=19, s=1.0, v=v)
     return None
 
 
@@ -422,7 +484,7 @@ class Relog:
         self.history = {}      # regla -> [timestamps]
         self.paused_until = 0
         self.last_status = None
-        self.info = dict(window=False, title="", in_world=False, phase="idle", acted=0)
+        self.info = dict(window=False, title="", in_world=False, phase="idle", acted=0, exp=None)
         self.ab_pending = False   # activar el Angel Baby cuando se vuelva a estar en el mundo
         self.drop_start = None    # cuando aparecio el cartel de desconexion (para medir cuanto tarda en volver)
         self.want_peek = False    # pedido de revisar el juego (lo activa el monitor de internet al volver la conexion)
@@ -431,14 +493,38 @@ class Relog:
         self.peek_started = 0.0
         self.restore_wait = 0.0
         self.last_peek = time.time()
+        self.outage_probe = None      # callable -> segundos que lleva el corte de internet actual (0 si no hay); lo pone la interfaz
+        self._peek_outage_done = False
+        self._front_done = False      # ya se puso el juego al frente en este corte
+        self.followups = []           # horas de revisiones de seguimiento tras un corte largo
+        self.peek_dwell = 6.0         # segundos que se queda restaurado antes de volver a minimizar
         self.world_since = None
         self.ab_tries = 0
+        self.server_retry_at = 0.0     # tras clickear Start: piso antes de volver a mirar si avanzo (reintento rapido)
+        self.server_probe_until = 0.0  # fin de la ventana de reintento rapido tras un Start
+        self._srv_base = None          # cuadro de Select Server justo antes del click con el que se compara
         self.awake = False         # el juego quedo 'despierto' tras una secuencia de clicks
         self.last_act = {}         # regla -> momento del ultimo click
         self.act_hist = {}         # regla -> clicks recientes (para escalar el metodo si no avanza)
         self.next_delay = cfg["poll_seconds"]
         self.drop_login_seen = False  # tras el cartel de desconexion, ya se vio la pantalla de login
+        self.unk_n = 0                # cuadros seguidos sin reconocer fuera del mundo
+        self.connfail_n = 0           # "Failed to connect" seguidos: el servidor esta caido (mantenimiento)
+        self.server_hold_until = 0.0  # no volver a apretar Start antes de esta hora
+        self._rec_t = 0.0             # registro de capturas no reconocidas
+        self._rec_n = 0
+        self._rec_last = None
+        self.expect_channel = None    # canal que se eligio en el relog: al entrar al mundo se comprueba que sea ese
+        self.ignore_ch = None         # canal "equivocado" ya avisado: no se guarda como preferido
+        self.relog_t = 0.0
         self._lock = threading.RLock()  # el ciclo, "Probar" y "Angel Baby" no deben clickear a la vez
+        try:
+            self.exp_reader = expmon.DigitReader()
+        except (OSError, ValueError):
+            self.exp_reader = None      # falta templates/exp_digits.npz: la experiencia no se mide
+        self.exp = expmon.ExpTracker()
+        self._exp_t = 0.0
+        self._exp_fail = 0
 
     def reset(self):
         """Al (re)iniciar la vigilancia: olvida pausas y reintentos de antes."""
@@ -446,10 +532,93 @@ class Relog:
         self.history, self.last_act, self.act_hist = {}, {}, {}
         self.drop_start = None
         self.drop_login_seen = False
+        self.connfail_n, self.server_hold_until = 0, 0.0
+        self._rec_n = 0
+        self.expect_channel = self.ignore_ch = None
         self.want_peek = self.restored_by_us = False
+        self._peek_outage_done = False
+        self.followups = []
         self.last_peek = time.time()
         self.ab_pending = False
         self.world_since = None
+        self.server_retry_at = self.server_probe_until = 0.0
+        self._srv_base = None
+
+    def _server_stuck(self, gray):
+        """True solo si tras clickear Start la pantalla de *Select Server* sigue igual que ANTES del
+        click (pixel a pixel, casi). Tras un Start exitoso el juego tarda ~2.4 s en mostrar el canal
+        y durante ese rato cambia aunque sea un poco (fundido de `transition`, cursor); si nada cambio
+        el click no registro y conviene reintentar ya, sin esperar el MIN_REPEAT."""
+        if self._srv_base is None or find(gray, "server_hdr", self.cfg["threshold"]) is None:
+            return False
+        sig = cv2.resize(gray, (96, 54), interpolation=cv2.INTER_AREA).astype(np.int16)
+        diff = int(np.abs(sig - self._srv_base).max())
+        changed = diff > 6   # cualquier zona que se mueva = transicion
+        self._srv_base = None
+        # MEDICION: queda en el registro para calibrar con relogs reales (¿una espera normal del servidor deja la pantalla quieta?)
+        log.info("Start: diferencia máxima %d a %.1f s del click (%s)", diff,
+                 time.time() - (self.server_probe_until - 6.0), "cambió" if changed else "idéntica")
+        return not changed   # identica a antes del click: el click no registro
+
+    def _exp_tick(self, bgr):
+        """Cada ~10 s, con el juego en el mundo y sin carteles: lee el % de experiencia del HUD."""
+        if not self.cfg.get("exp_tracking", True) or self.exp_reader is None:
+            return
+        now = time.time()
+        if now - self._exp_t < 10:
+            return
+        self._exp_t = now
+        pct = self.exp_reader.read_pct(bgr)
+        if pct is None:
+            self._exp_fail += 1
+            self.info["exp"] = None
+            if self._exp_fail == 6:  # una sola vez por racha
+                log.warning("no puedo leer la experiencia del HUD (¿la ventana no mide 1366x768 o hay algo encima?)")
+            return
+        self._exp_fail = 0
+        self.info["exp"] = (pct, now)
+        kind = self.exp.feed(pct, now)
+        if kind == "lvl":
+            log.info("¡Subiste de nivel! (experiencia %.2f %%)", pct)
+        elif kind == "loss":
+            log.warning("Bajó la experiencia a %.2f %% (¿murió el personaje?)", pct)
+        minutes = self.cfg.get("exp_stall_min", 10)
+        if minutes and minutes > 0:
+            s = self.exp.should_notify_stall(minutes, now)
+            if s:
+                log.warning("Sin ganar experiencia hace %d min: ¿Angel Baby parado o personaje muerto?", s // 60)
+
+    def _record(self, bgr, tag):
+        """Guarda en capturas/ un cuadro que no se reconocio (si cambio respecto del ultimo guardado). Maximo 40 por inicio."""
+        if not self.cfg.get("capture_unknown", True) or self._rec_n >= 60:
+            return
+        now = time.time()
+        if now - self._rec_t < 1.0:
+            return
+        small = cv2.resize(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY), (96, 54), interpolation=cv2.INTER_AREA).astype(np.int16)
+        if self._rec_last is not None and float(np.abs(small - self._rec_last).mean()) < 6:
+            return
+        try:
+            folder = ROOT / "capturas"
+            folder.mkdir(exist_ok=True)
+            cv2.imwrite(str(folder / f"{time.strftime('%H%M%S')}_{tag}.png"), bgr, [cv2.IMWRITE_PNG_COMPRESSION, 6])
+        except OSError:
+            return
+        self._rec_t, self._rec_last = now, small
+        self._rec_n += 1
+
+    def save_frame(self, tag="manual"):
+        """Guarda ya mismo la pantalla del juego en capturas/ (boton 'Capturar'). Devuelve la ruta o None."""
+        hwnd = find_window(self.cfg)
+        if not hwnd or win32gui.IsIconic(hwnd):
+            log.warning("no puedo capturar: el juego no esta visible")
+            return None
+        folder = ROOT / "capturas"
+        folder.mkdir(exist_ok=True)
+        path = folder / f"{time.strftime('%H%M%S')}_{tag}.png"
+        cv2.imwrite(str(path), grab(hwnd), [cv2.IMWRITE_PNG_COMPRESSION, 6])
+        log.info("Captura guardada: capturas/%s", path.name)
+        return path
 
     def status(self, msg):
         if msg != self.last_status:
@@ -469,26 +638,55 @@ class Relog:
         mode = "mouse real" if self.cfg["input"] == "foreground" else METHODS[min(level, 2)]
         if name == "channel":
             s = hit["s"]
+            L = CHANNEL_LAYOUT[hit.get("v", "sd")]
             ch = self.channel()
-            rx = hit["x"] + CHANNEL_ROW0[0] * s
-            ry = hit["y"] + (CHANNEL_ROW0[1] + CHANNEL_PITCH * (ch - 1)) * s
-            ox = hit["x"] + CHANNEL_OK[0] * s
-            oy = hit["y"] + CHANNEL_OK[1] * s
+            rx = hit["x"] + L["row0"][0] * s
+            ry = hit["y"] + (L["row0"][1] + L["pitch"] * (ch - 1)) * s
+            ox = hit["x"] + L["ok"][0] * s
+            oy = hit["y"] + L["ok"][1] * s
             log.info("%s: canal %d -> click fila (%d,%d), luego aceptar [%s]", tag, ch, rx, ry, mode)
             if not dry:
-                click(hwnd, rx, ry, self.cfg, level)
-                time.sleep(0.3)
+                chosen = False
+                for tryn in range(3):   # el click en la fila a veces no registra: se verifica que quede marcada
+                    click(hwnd, rx, ry, self.cfg, level)
+                    time.sleep(0.35)
+                    sel = self.selected_channel_row(grab(hwnd), hit)
+                    if sel == ch:
+                        chosen = True
+                        break
+                    log.info("canal: quedó marcada la fila %s en vez de la %d; reintento (%d/3)", sel, ch, tryn + 1)
+                if not chosen:   # mejor no confirmar que entrar al canal que viene por defecto (suele estar lleno)
+                    log.warning("no pude seleccionar el canal %d; no confirmo", ch)
+                    return
                 g = grab_gray(hwnd)
                 ok = find(g, "chan_ok", self.cfg["threshold"],
                           (hit["x"], hit["y"] + 200 * s, hit["x"] + 320 * s, hit["y"] + 400 * s))
                 if ok:
                     ox, oy = center(ok)
                 click(hwnd, ox, oy, self.cfg, level)
+                self.expect_channel, self.relog_t = ch, time.time()
             return
         x, y = center(hit)
         log.info("%s: %s -> click (%d,%d) [%s %.2f] [%s]", tag, name, x, y, rule["button"], hit["score"], mode)
         if not dry:
             click(hwnd, x, y, self.cfg, level)
+
+    def selected_channel_row(self, img_bgr, hdr):
+        """Numero (1-5) de la fila de canal marcada (fondo rojizo: R bastante mayor que B), o None."""
+        s = hdr["s"]
+        L = CHANNEL_LAYOUT[hdr.get("v", "sd")]
+        best = None
+        for n in range(1, 6):
+            cy = hdr["y"] + (L["row0"][1] + L["pitch"] * (n - 1)) * s
+            cx = hdr["x"] + L["row0"][0] * s
+            roi = img_bgr[int(cy) - 5:int(cy) + 6, int(cx - 70 * s):int(cx + 70 * s)]
+            if roi.size == 0:
+                continue
+            m = roi.reshape(-1, 3).mean(axis=0)
+            rb = float(m[2] - m[0])
+            if rb > 25 and (best is None or rb > best[0]):
+                best = (rb, n)
+        return best[1] if best else None
 
     def angel_baby_on(self, hwnd):
         """Ctrl+R, tilda Attack (y Enable si hiciera falta) y cierra el panel. Devuelve True si quedo activo."""
@@ -519,25 +717,26 @@ class Relog:
             log.warning("no pude abrir el panel del Angel Baby (captura en fallo_angelbaby.png)")
             return False
         mx, my = m["x"], m["y"]
+        L = AB_LAYOUT[m.get("v", "sd")]
         if not find(gray(), "ab_attack", thr):  # solo si no estamos ya en la pestana Combat
-            bg_click(hwnd, mx + AB_COMBAT_TAB[0], my + AB_COMBAT_TAB[1], sleep=False)
+            bg_click(hwnd, mx + L["tab"][0], my + L["tab"][1], sleep=False)
             time.sleep(0.3)
         ok = False
         for _ in range(3):
-            if is_checked(grab(hwnd), mx + AB_ATTACK_BOX[0], my + AB_ATTACK_BOX[1]):
+            if is_checked(grab(hwnd), mx + L["attack"][0], my + L["attack"][1]):
                 ok = True
                 break
             log.info("tildando Attack del Angel Baby")
-            bg_click(hwnd, mx + AB_ATTACK_BOX[0], my + AB_ATTACK_BOX[1], sleep=False)
+            bg_click(hwnd, mx + L["attack"][0], my + L["attack"][1], sleep=False)
             time.sleep(0.5)
         if not ok:
             log.warning("no pude tildar Attack")
-        elif not is_checked(grab(hwnd), mx + AB_ENABLE_BOX[0], my + AB_ENABLE_BOX[1]):
+        elif not is_checked(grab(hwnd), mx + L["enable"][0], my + L["enable"][1]):
             log.info("tildando Enable Angel Baby")
-            bg_click(hwnd, mx + AB_ENABLE_BOX[0], my + AB_ENABLE_BOX[1], sleep=False)
+            bg_click(hwnd, mx + L["enable"][0], my + L["enable"][1], sleep=False)
             time.sleep(0.4)
         if self.cfg.get("ab_close_panel", True):
-            bg_click(hwnd, mx + AB_CLOSE_BTN[0], my + AB_CLOSE_BTN[1], sleep=False)  # boton X (el mouse es lo mas confiable)
+            bg_click(hwnd, mx + L["close"][0], my + L["close"][1], sleep=False)  # boton X (el mouse es lo mas confiable)
             if not wait_panel(False, 12):
                 bg_keys(hwnd, [win32con.VK_CONTROL], ord("R"), sleep=False)  # respaldo
                 if not wait_panel(False, 12):
@@ -612,35 +811,80 @@ class Relog:
             self.info.update(window=False, title="", in_world=False, phase="nowindow")
             self.status("sin ventana del juego (angel.dat); esperando")
             return
+        ongoing = self.outage_probe() if self.outage_probe else 0.0
+        if ongoing <= 0:
+            self._peek_outage_done = False
         if win32gui.IsIconic(hwnd):
             self.info.update(window=True, in_world=False, phase="minimized")
             if self.restored_by_us and time.time() - self.peek_started > 5:
                 self.restored_by_us = False  # lo volvio a minimizar el usuario: ya no es cosa nuestra
+            now = time.time()
             every = self.cfg.get("peek_every_min", 0)
-            due = self.want_peek or (every > 0 and time.time() - self.last_peek >= every * 60)
-            if due and self.cfg.get("restore_minimized", True):
-                reason = self.peek_reason if self.want_peek else "revisión periódica"
+            during = self.cfg.get("peek_during_outage_s", 0)
+            reason = None
+            outage_peek = True
+            if self.want_peek:
+                reason, dwell = self.peek_reason, self.cfg.get("peek_dwell_s", 45)
+            elif during and ongoing >= during and not self._peek_outage_done:
+                reason, dwell = f"el internet lleva {int(ongoing)} s caído", self.cfg.get("peek_dwell_s", 45)
+                self._peek_outage_done = True
+            elif self.followups and now >= self.followups[0]:
+                reason, dwell = "revisión posterior al corte", self.cfg.get("peek_dwell_s", 45)
+            elif every > 0 and now - self.last_peek >= every * 60:
+                reason, dwell = "revisión periódica", 6.0
+                outage_peek = False
+            if reason and self.cfg.get("restore_minimized", True):
                 self.want_peek = False
-                self.last_peek = time.time()
+                self.followups = [t for t in self.followups if t > now]
+                self.last_peek = now
                 if self.cfg["dry_run"]:
                     log.info("[ENSAYO] restauraria el juego minimizado para revisarlo (%s)", reason)
                 else:
+                    if outage_peek:   # corte de internet: se deja abierto (no se vuelve a minimizar)
+                        if self.cfg.get("outage_front", True):
+                            log.info("el juego está minimizado: lo abro AL FRENTE para revisarlo (%s)", reason)
+                            bring_to_front(hwnd)
+                        else:
+                            log.info("el juego está minimizado: lo abro DE FONDO para revisarlo (%s)", reason)
+                            win32gui.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+                            send_to_back(hwnd)
+                        self._front_done = True
+                        self.restore_wait = now + 1.5
+                        self.next_delay = 0.4
+                        return
                     log.info("el juego está minimizado: lo restauro sin darle el foco para revisarlo (%s)", reason)
                     win32gui.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+                    send_to_back(hwnd)
                     self.restored_by_us = True
-                    self.peek_started = time.time()
-                    self.restore_wait = time.time() + 1.5  # darle tiempo a dibujar antes de capturarlo
+                    self.peek_dwell = dwell
+                    self.peek_started = now
+                    self.restore_wait = now + 1.5  # darle tiempo a dibujar antes de capturarlo
                     self.next_delay = 0.4
                     return
             self.status("el juego esta minimizado y no lo puedo ver (se restaura solo si se corta el internet)"
                         if self.cfg.get("restore_minimized", True) else
                         "el juego esta minimizado y no lo puedo ver: dejalo detras de otras ventanas, sin minimizar")
             return
+        # juego visible y el internet recien se corto: al frente (o de fondo) una sola vez por corte
+        if ongoing <= 0:
+            self._front_done = False
+        elif not self._front_done and ongoing >= self.cfg.get("peek_min_outage", 3):
+            self._front_done = True
+            if not self.cfg["dry_run"]:
+                if self.cfg.get("outage_front", True):
+                    log.info("se cortó el internet: dejo el juego al frente")
+                    bring_to_front(hwnd)
+                else:
+                    log.info("se cortó el internet: dejo el juego de fondo")
+                    send_to_back(hwnd)
         # con el juego visible no hace falta "revisarlo": que un pedido viejo no lo abra de golpe cuando lo minimices
         self.want_peek = False
+        self.followups = [t for t in self.followups if t > time.time()]
         if not self.restored_by_us:
             self.last_peek = time.time()
         if self.restored_by_us:
+            if ongoing > 0:
+                self.peek_started = time.time()  # mientras dure el corte no se cuenta el tiempo de espera: corre desde que vuelva
             if time.time() < self.restore_wait:
                 self.next_delay = 0.4
                 return
@@ -656,13 +900,66 @@ class Relog:
         self.info.update(window=True, title=title, in_world=in_world, phase="world" if in_world else "unknown")
         if m:
             ch = int(m.group("ch"))
-            if self.state.get("channel") != ch:
+            if self.expect_channel is not None:
+                if ch != self.expect_channel:
+                    self.ignore_ch = ch
+                    log.warning("Entré a %s-%d, pero el canal elegido era el %d (¿estaba lleno?). No lo guardo como preferido.",
+                                m.group("server"), ch, self.expect_channel)
+                self.expect_channel = None
+            elif ch == self.ignore_ch:
+                pass   # sigue en el canal equivocado ya avisado
+            elif self.state.get("channel") != ch:
+                self.ignore_ch = None
                 self.state.update(channel=ch, server=m.group("server"))
                 save_state(self.state)
                 log.info("canal recordado: %s-%d", m.group("server"), ch)
         else:
             self.world_since = None
-        gray = grab_gray(hwnd)
+        bgr, gray = grab_pair(hwnd)
+        if bgr.size == 0:   # la ventana se minimizo o cambio de tamano justo ahora
+            self.next_delay = 0.5
+            return
+        if self.restored_by_us and float(bgr.std()) < 8.0:   # captura en negro/uniforme: el juego todavia no dibuja
+            if time.time() - self.peek_started < 12:
+                self.next_delay = 0.5
+                return
+            log.warning("restauré el juego pero no se ve su contenido (captura vacía); lo dejo abierto para que lo veas")
+            self.restored_by_us = False
+        elif self.restored_by_us and not getattr(self, "_peek_seen", False):
+            self._peek_seen = True
+            log.info("el juego restaurado ya dibuja: lo reviso")
+        if not self.restored_by_us:
+            self._peek_seen = False
+        # Start perdido: si venimos de clickear en Select Server y a los ~1 s la pantalla sigue identica a
+        # la de antes del click, reintentar sin esperar el MIN_REPEAT (que cuesta ~3 s de mas). Si algo
+        # cambio (transicion/carga) no se toca, para no clickear encima de una pantalla que si avanzo.
+        if (self.server_probe_until and time.time() < self.server_probe_until and not in_world
+                and time.time() >= self.server_retry_at and self._server_stuck(gray)
+                and self.cfg.get("server_early_retry", False)):
+            rule = next(r for r in RULES if r["name"] == "server")
+            self.info["phase"] = "server"
+            self.next_delay = self.cfg["fast_poll"]
+            if not online():
+                self.info["phase"] = "offline"
+                self.status("sin internet; espero a que vuelva")
+                self.next_delay = 1.0
+                return
+            btn = find(gray, "start_btn", self.cfg["threshold"])
+            if btn:
+                self.status("Start no avanzó; reintento")
+                self.do(hwnd, rule, btn, gray, 1)
+                self.act_hist["server"] = [t for t in self.act_hist.get("server", [])
+                                           if time.time() - t < 20] + [time.time()]
+                self.last_act["server"] = time.time()
+                self.info["acted"] += 1
+                self.awake = True
+                # re-armar por si este reintento tambien se pierde
+                self.server_retry_at = time.time() + self.cfg.get("server_early_probe", 1.0)
+                self.server_probe_until = time.time() + 6.0
+                self._srv_base = cv2.resize(gray, (96, 54), interpolation=cv2.INTER_AREA).astype(np.int16)
+                self.last_status = None
+                time.sleep(self.cfg["action_cooldown"])
+            return
         hit = detect(gray, in_world, self.cfg)
         if self.drop_start is not None and not in_world:
             self.drop_login_seen = True
@@ -677,6 +974,22 @@ class Relog:
             netmon.record_game_event("reingreso", dur)
             log.info("de vuelta en el mundo tras %s", netmon.fmt_dur(dur))
             self.drop_start = None
+        if not hit and not in_world:
+            self._record(bgr, "login")
+        elif not hit and in_world and (ongoing >= 30 or self.ab_pending or self.drop_start is not None):
+            self._record(bgr, "mundo")     # cartel de desconexion o avisos al entrar, tapados por un estilo de texto nuevo
+        if hit or in_world:
+            self.unk_n = 0
+        elif not WIDE_SCALES:
+            self.unk_n += 1
+            if self.unk_n % 12 == 0:   # ~4 s sin reconocer nada: probar una vez con otras escalas por si la interfaz esta estirada
+                global ACTIVE_SCALES
+                keep, ACTIVE_SCALES = ACTIVE_SCALES, SCALES
+                wide = detect(gray, in_world, self.cfg)
+                ACTIVE_SCALES = keep
+                if wide and abs(wide[1]["s"] - 1.0) > 1e-6:
+                    globals()["WIDE_SCALES"] = True
+                    log.info("La interfaz del juego aparece escalada (x%.2f): busco en varias escalas.", wide[1]["s"])
         if not hit:
             if in_world and self.ab_pending:
                 self.next_delay = self.cfg["fast_poll"]
@@ -686,10 +999,12 @@ class Relog:
                 if self.awake and win32gui.GetForegroundWindow() != hwnd:
                     _sleep(hwnd)  # termino la secuencia: el juego vuelve a su estado inactivo normal
                 self.awake = False
-                if self.restored_by_us and time.time() - self.peek_started >= 5 and self.drop_start is None:
+                if (self.restored_by_us and ongoing <= 0 and self.drop_start is None
+                        and time.time() - self.peek_started >= self.peek_dwell):
                     win32gui.ShowWindow(hwnd, SW_SHOWMINNOACTIVE)
                     self.restored_by_us = False
                     log.info("todo en orden: vuelvo a minimizar el juego")
+                self._exp_tick(bgr)
             else:
                 self.next_delay = self.cfg["fast_poll"]  # cargando entre pantallas: mirar seguido
             self.status("en el mundo, todo normal" if in_world else "pantalla no reconocida (cargando?); espero")
@@ -697,6 +1012,11 @@ class Relog:
         rule, btn = hit
         name = rule["name"]
         self.next_delay = self.cfg["fast_poll"]
+        if name == "server" and time.time() < self.server_hold_until:
+            self.status("servidor caído: espero antes de volver a apretar Start")
+            self.info["phase"] = "offline"
+            self.next_delay = 2.0
+            return
         if time.time() - self.last_act.get(name, 0) < MIN_REPEAT.get(name, 1.5):
             return  # recien clickeado: darle tiempo a que cambie la pantalla
         if not online():
@@ -710,12 +1030,26 @@ class Relog:
             return
         now = time.time()
         recent = [t for t in self.act_hist.get(name, []) if now - t < 20]
-        level = len(recent)  # 0 = primer intento; si el mismo paso se repite, escalar el metodo de click
+        # En carteles y login el click corto nunca registro (en todos los relogs hacia falta el segundo intento):
+        # se empieza por el largo, se reintenta con el largo y recien al tercer intento se usa el mouse real.
+        level = 1 if len(recent) < 2 else 2
         self.do(hwnd, rule, btn, gray, level)
+        if name == "connfail":
+            self.connfail_n += 1
+            wait = min(30 * 2 ** (self.connfail_n - 1), 120)    # 30 s, 60 s, 120 s, 120 s...
+            self.server_hold_until = time.time() + wait
+            if self.connfail_n in (1, 4):
+                log.warning("El servidor no responde (¿mantenimiento?): reintento en %d s, y cada 2 min mientras siga caído.", wait)
+        elif name in ("channel", "character"):
+            self.connfail_n, self.server_hold_until = 0, 0.0   # el servidor volvio
         self.act_hist[name] = recent + [now]
         self.awake = True
         self.last_act[name] = time.time()
         self.info["acted"] += 1
+        if name == "server":   # ventana de reintento rapido por si el click se pierde
+            self.server_retry_at = time.time() + self.cfg.get("server_early_probe", 1.0)
+            self.server_probe_until = time.time() + 6.0
+            self._srv_base = cv2.resize(gray, (96, 54), interpolation=cv2.INTER_AREA).astype(np.int16)
         if name == "character" and self.cfg.get("angel_baby_after_relog", True):
             self.ab_pending, self.ab_tries, self.world_since = True, 0, None
         self.last_status = None

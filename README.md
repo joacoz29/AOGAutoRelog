@@ -17,6 +17,10 @@ Herramienta para **Angels Online Global** (Windows) que vuelve a entrar al juego
 - Si un paso se repite sin avanzar, escala el método: click corto → click largo → mouse real solo para ese click.
 - Si el juego está **minimizado**, lo restaura sin darle el foco cuando vuelve internet, reloguea y lo vuelve a minimizar.
 
+**Experiencia** (pestaña *Experiencia*)
+- Lee el % de experiencia del HUD y muestra el ritmo por hora, lo ganado en la sesión, el tiempo estimado al próximo nivel, las subidas de nivel y la experiencia perdida por muertes.
+- Avisa si el personaje pasa X minutos sin ganar experiencia (Angel Baby parado o personaje muerto).
+
 **Monitor de internet** (pestaña *Conexión*)
 - Una prueba por segundo a tres servidores independientes (Cloudflare, Google, Quad9). Un corte se declara con fallas seguidas en los tres.
 - Registra inicio, fin y duración de cada corte, latencia, % de pruebas fallidas y disponibilidad.
@@ -28,7 +32,7 @@ Herramienta para **Angels Online Global** (Windows) que vuelve a entrar al juego
 ## Requisitos
 - Windows 10/11
 - Python 3.10 o superior
-- Cliente de Angels Online Global en **inglés**, con la ventana a 1366×768 (otros tamaños funcionan, pero el reconocimiento es más lento)
+- Cliente de Angels Online Global en **inglés**. Funciona con la ventana de 1366×768 y con otras resoluciones (probado a 1920×1032 con el *Render Fix* de BetterAngels). El juego tiene **dos estilos de texto**; ver [Estilos de dibujo](docs/FUNCIONAMIENTO.md#estilos-de-dibujo-del-juego).
 
 ## Instalación
 
@@ -69,6 +73,7 @@ Todo queda local, en `datos/`: `cortes.jsonl`, `latencia.csv`, `sesiones.jsonl`,
 |---|---|
 | [Arquitectura](docs/ARQUITECTURA.md) | Diagramas de componentes, hilos y flujo; decisiones de diseño |
 | [Cómo funciona](docs/FUNCIONAMIENTO.md) | Reconocimiento de pantallas, flujo del relog, envío de entrada, Angel Baby, juego minimizado |
+| [Experiencia](docs/EXPERIENCIA.md) | Cómo se lee el HUD, fiabilidad, cálculo del ritmo y reentrenamiento de los dígitos |
 | [Monitor de internet y datos](docs/DATOS.md) | Cómo se mide un corte, formato de los archivos, estadísticas e informe |
 | [Configuración](docs/CONFIGURACION.md) | Todas las opciones de `config.json` |
 | [Guía de desarrollo](docs/DESARROLLO.md) | Entorno, plantillas, cómo agregar pantallas y trampas conocidas |
@@ -93,8 +98,10 @@ flowchart LR
 | `autorelog.py` | Motor: captura, reconocimiento por plantillas, clicks, relog, Angel Baby |
 | `gui.py` | Interfaz (tkinter) |
 | `netmon.py` | Monitor de internet, estadísticas e informes |
+| `expmon.py` | Lectura de la experiencia del HUD y estadísticas de ritmo |
 | `tray.py` | Icono de la bandeja (pywin32) |
-| `templates/` | Recortes de la interfaz del juego usados para reconocer pantallas |
+| `templates/` | Recortes de la interfaz del juego (`*.png`) y prototipos de los dígitos del HUD (`exp_digits.npz`) |
+| `tools/train_digits.py` | Regenera los prototipos de dígitos a partir de capturas etiquetadas |
 
 ## Limitaciones conocidas
 - Las plantillas están hechas con el cliente en inglés; otro idioma necesita plantillas nuevas.

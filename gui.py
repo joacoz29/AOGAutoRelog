@@ -10,6 +10,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 import autorelog as core
+import expmon
 import netmon
 import tray
 
@@ -102,6 +103,7 @@ class App(tk.Tk):
         self.configure(bg=BG)
         self.cfg = core.load_cfg()
         self.bot = core.Relog(self.cfg)
+        self.bot.outage_probe = self._outage_secs
         self.running = False
         self.stop_evt = threading.Event()
         self.q = queue.Queue()
@@ -141,6 +143,7 @@ class App(tk.Tk):
         self.page_main = self.build_main(self.pages)
         self.page_cfg = self.build_settings(self.pages)
         self.page_net = self.build_net(self.pages)
+        self.page_exp = self.build_exp(self.pages)
         self.build_right(body)
         self.show("main")
         self.update_sub()
@@ -153,6 +156,7 @@ class App(tk.Tk):
         self.after(1500, self.refresh_client)
         self.after(600, self.refresh_net_header)
         self.after(900, self.refresh_net)
+        self.after(1100, self.refresh_exp)
 
     # ------------------------------------------------------------ construccion
     def style_widgets(self):
@@ -191,7 +195,7 @@ class App(tk.Tk):
         sb.pack_propagate(False)
         self.nav = {}
         tk.Label(sb, text="CUENTA", font=("Consolas", 8, "bold"), bg=PANEL, fg=MUTED).pack(anchor="w", padx=18, pady=(18, 6))
-        for key, text in (("main", "Auto Relog"), ("net", "Conexión"), ("cfg", "Ajustes")):
+        for key, text in (("main", "Auto Relog"), ("exp", "Experiencia"), ("net", "Conexión"), ("cfg", "Ajustes")):
             lb = tk.Label(sb, text="  " + text, font=F_UI, anchor="w", bg=PANEL, fg=FG, padx=10, pady=8, cursor="hand2")
             lb.pack(fill="x", padx=8)
             lb.bind("<Button-1>", lambda e, k=key: self.show(k))
@@ -221,6 +225,7 @@ class App(tk.Tk):
         self.sub_lbl.pack(anchor="w")
         self.start_btn = Btn(top, "Iniciar", self.toggle_run, primary=True)
         self.start_btn.pack(side="right")
+        Btn(top, "Capturar", lambda: threading.Thread(target=self.bot.save_frame, daemon=True).start()).pack(side="right", padx=(8, 0))
         Btn(top, "Angel Baby", self.test_ab).pack(side="right", padx=(8, 0))
         Btn(top, "Probar", self.test_once).pack(side="right", padx=8)
 
@@ -300,6 +305,12 @@ class App(tk.Tk):
             check("fallback_real_mouse"))
         row("Abrir el juego si está minimizado", "Si se corta el internet y el juego está minimizado, lo restaura sin darle "
             "el foco, reloguea y lo vuelve a minimizar.", check("restore_minimized"))
+        row("Al cortarse internet, juego al frente", "Tildado: abre el juego y lo deja AL FRENTE (no lo vuelve a minimizar). "
+            "Destildado: lo deja de fondo, detrás de las demás ventanas.", check("outage_front"))
+        row("Restaurarlo en un corte largo (s)", "Si el internet lleva tantos segundos caído y el juego está minimizado, "
+            "lo restaura para ver el cartel y reloguear apenas vuelva (0 = no).", spin("peek_during_outage_s", 0, 600))
+        row("Dejarlo mirando tras un corte (s)", "Cuánto se queda restaurado después de un corte antes de volver a minimizarlo.",
+            spin("peek_dwell_s", 5, 300))
         row("Revisarlo cada (minutos)", "Si sigue minimizado, lo restaura brevemente cada tanto para ver si se cayó "
             "(0 = nunca).", spin("peek_every_min", 0, 120))
         row("Al cerrar, seguir en la bandeja", "La X oculta la ventana y el programa sigue funcionando en los iconos ocultos "
@@ -307,6 +318,10 @@ class App(tk.Tk):
         row("Avisos desde la bandeja", "Notificación cuando vuelve el internet o termina de reloguear (solo con la ventana oculta).",
             check("tray_notifications"))
         row("Iniciar oculto en la bandeja", "Al abrir el programa no muestra la ventana.", check("start_in_tray"))
+        row("Medir la experiencia", "Lee el % de exp del HUD cada ~10 s (con el juego visible) para calcular el ritmo por hora.",
+            check("exp_tracking"))
+        row("Avisar si no gana exp (minutos)", "Aviso si pasan estos minutos sin ganar experiencia: Angel Baby parado o personaje "
+            "muerto (0 = nunca).", spin("exp_stall_min", 0, 240))
         row("Activar el Angel Baby al volver", "Tras reloguear: Ctrl+R y tilda Attack (donde esté parado el personaje).",
             check("angel_baby_after_relog"))
         row("Cerrar el panel del Angel Baby", "Lo cierra (con su botón ✕) cuando termina de activarlo.", check("ab_close_panel"))
@@ -394,11 +409,167 @@ class App(tk.Tk):
         self.net_msg.pack(side="left", padx=12)
         return p
 
+    def _outage_secs(self):
+        """Segundos que lleva el corte de internet actual (0 si no hay)."""
+        try:
+            o = self.net.snapshot()["outage"]
+            return time.time() - o["inicio"] if o else 0.0
+        except Exception:  # noqa: BLE001
+            return 0.0
+
     def on_outage_end(self, rec):
         """Volvio internet tras un corte: si el juego esta minimizado, pedir que se lo restaure y revise."""
-        if self.running and rec["dur"] >= self.cfg.get("peek_min_outage", 3):
+        if not self.running:
+            core.log.info("Internet volvió tras %s, pero la vigilancia está detenida: no reviso el juego.",
+                          netmon.fmt_dur(rec["dur"]))
+            return
+        if rec["dur"] >= self.cfg.get("peek_min_outage", 3):
             self.bot.peek_reason = f"internet volvió tras {netmon.fmt_dur(rec['dur'])}"
             self.bot.want_peek = True
+        if rec["dur"] >= 30:   # el cartel de desconexion puede aparecer un rato despues: revisar de nuevo mas tarde
+            now = time.time()
+            self.bot.followups = [now + 60, now + 180]
+
+    def build_exp(self, parent):
+        p = tk.Frame(parent, bg=BG)
+        p.grid(row=0, column=0, sticky="nsew")
+        head = tk.Frame(p, bg=BG)
+        head.pack(fill="x", padx=28, pady=(24, 4))
+        tk.Label(head, text="Experiencia", font=F_H1, bg=BG, fg=FG).pack(side="left")
+        self.exp_seg = Segmented(head, [("ses", "Sesión"), ("1h", "1 hora"), ("hoy", "Hoy"), ("todo", "Todo")], "ses",
+                                 lambda k: self.paint_exp())
+        self.exp_seg.pack(side="right", pady=(10, 0))
+        tk.Label(p, text="Lee el % de experiencia del HUD y calcula el ritmo por hora. Solo mide mientras la vigilancia está "
+                 "activa y el juego está visible (no minimizado).", font=F_UI, bg=BG, fg=MUTED, justify="left",
+                 wraplength=640).pack(anchor="w", padx=28)
+
+        cur = card(p)
+        cur.pack(fill="x", padx=28, pady=(12, 8))
+        top = tk.Frame(cur, bg=PANEL)
+        top.pack(fill="x", padx=18, pady=(12, 4))
+        self.exp_pct = tk.Label(top, text="— %", font=("Georgia", 22), bg=PANEL, fg=FG)
+        self.exp_pct.pack(side="left")
+        col = tk.Frame(top, bg=PANEL)
+        col.pack(side="left", padx=14)
+        self.exp_state = tk.Label(col, text="", font=("Segoe UI", 11, "bold"), bg=PANEL, fg=MUTED, anchor="w")
+        self.exp_state.pack(anchor="w")
+        self.exp_sub = tk.Label(col, text="", font=F_SM, bg=PANEL, fg=MUTED, anchor="w")
+        self.exp_sub.pack(anchor="w")
+        self.exp_bar = tk.Canvas(cur, height=12, bg=PANEL, highlightthickness=0)
+        self.exp_bar.pack(fill="x", padx=18, pady=(2, 12))
+
+        grid = tk.Frame(p, bg=BG)
+        grid.pack(fill="x", padx=28)
+        self.exp_cards = {}
+        defs = [("rate", "Exp por hora"), ("recent", "Ritmo (últ. 30 min)"), ("gained", "Ganada"), ("active", "Tiempo activo"),
+                ("eta", "Próximo nivel en"), ("levels", "Niveles subidos"), ("lost", "Exp perdida"), ("stall", "Sin ganar hace")]
+        for i, (k, title) in enumerate(defs):
+            c = tk.Frame(grid, bg=PANEL, highlightthickness=1, highlightbackground=LINE)
+            c.grid(row=i // 4, column=i % 4, sticky="nsew", padx=(0 if i % 4 == 0 else 6, 0), pady=(0, 6))
+            grid.columnconfigure(i % 4, weight=1, uniform="ec")
+            tk.Label(c, text=title, font=F_SM, bg=PANEL, fg=MUTED, anchor="w").pack(anchor="w", padx=12, pady=(8, 0))
+            v = tk.Label(c, text="—", font=("Segoe UI", 14, "bold"), bg=PANEL, fg=FG, anchor="w")
+            v.pack(anchor="w", padx=12)
+            s = tk.Label(c, text="", font=F_SM, bg=PANEL, fg=MUTED, anchor="w")
+            s.pack(anchor="w", padx=12, pady=(0, 8))
+            self.exp_cards[k] = (v, s)
+
+        ch = card(p)
+        ch.pack(fill="both", expand=True, padx=28, pady=(2, 8))
+        tk.Label(ch, text="EXPERIENCIA GANADA · ÚLTIMAS 3 HORAS (barras de 10 min)", font=("Consolas", 8, "bold"),
+                 bg=PANEL, fg=MUTED).pack(anchor="w", padx=18, pady=(10, 2))
+        self.exp_canvas = tk.Canvas(ch, height=110, bg=PANEL, highlightthickness=0)
+        self.exp_canvas.pack(fill="both", expand=True, padx=18, pady=(0, 10))
+
+        bar = tk.Frame(p, bg=BG)
+        bar.pack(fill="x", padx=28, pady=(0, 14))
+        Btn(bar, "Reiniciar sesión", self.exp_reset).pack(side="left")
+        Btn(bar, "Abrir carpeta de datos", lambda: self.open_path(netmon.DATA)).pack(side="left", padx=8)
+        return p
+
+    def exp_reset(self):
+        self.bot.exp.reset_session()
+        core.log.info("Sesión de experiencia reiniciada.")
+        self.paint_exp()
+
+    def refresh_exp(self):
+        if self.current_page == "exp":
+            try:
+                self.paint_exp()
+            except Exception:  # noqa: BLE001
+                core.log.exception("error al dibujar la pestaña Experiencia")
+        self.after(2000, self.refresh_exp)
+
+    def paint_exp(self):
+        now = time.time()
+        ex = self.bot.exp
+        k = self.exp_seg.value
+        if k == "ses":
+            st = ex.stats(None, now)
+        elif k == "1h":
+            st = ex.stats(now - 3600, now)
+        elif k == "hoy":
+            lt = time.localtime(now)
+            st = ex.stats(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)), now)
+        else:
+            st = ex.stats(0, now)
+        recent = ex.stats(now - 1800, now)
+
+        info = self.bot.info.get("exp")
+        pct = ex.last_pct
+        self.exp_pct.config(text="— %" if pct is None else f"{pct:.2f} %")
+        if info and now - info[1] < 60:
+            self.exp_state.config(text="Leyendo del HUD", fg=ACCENT)
+            self.exp_sub.config(text=f"última lectura hace {int(now - info[1])} s")
+        else:
+            why = ("la vigilancia está detenida" if not self.running else
+                   "el juego está minimizado" if self.bot.info.get("phase") == "minimized" else
+                   "esperando una lectura (¿ventana en 1366×768, en el mundo y sin carteles?)")
+            self.exp_state.config(text="Sin lectura", fg=WARN)
+            self.exp_sub.config(text=why)
+        cv = self.exp_bar
+        cv.delete("all")
+        W = max(cv.winfo_width(), 200)
+        cv.create_rectangle(0, 2, W, 10, fill=BG, outline=LINE)
+        if pct is not None:
+            cv.create_rectangle(0, 2, W * pct / 100.0, 10, fill=ACCENT, outline="")
+
+        def put(key, value, sub="", color=FG):
+            v, s = self.exp_cards[key]
+            v.config(text=value, fg=color)
+            s.config(text=sub)
+
+        eta = ex.eta_next_level(now)
+        stall = ex.stalled_for(now)
+        limit = (self.cfg.get("exp_stall_min", 10) or 0) * 60
+        put("rate", "—" if st["rate"] is None else f"{st['rate']:.1f} %/h",
+            "" if st["rate"] is not None else "hacen falta ~2 min de datos")
+        put("recent", "—" if recent["rate"] is None else f"{recent['rate']:.1f} %/h")
+        put("gained", f"{st['gained']:.2f} %", f"≈ {st['gained'] / 100:.2f} niveles")
+        put("active", expmon.fmt_dur(st["active"]), "con lectura continua")
+        put("eta", expmon.fmt_dur(eta), "" if pct is None else f"faltan {100 - pct:.2f} %")
+        put("levels", str(st["levels"]))
+        put("lost", f"{st['lost']:.2f} %", "por muertes" if st["lost"] > 0 else "")
+        put("stall", "—" if stall is None else expmon.fmt_dur(stall), "",
+            WARN if (stall is not None and limit and stall >= limit) else FG)
+
+        c = self.exp_canvas
+        c.delete("all")
+        W, H = max(c.winfo_width(), 300), max(c.winfo_height(), 80)
+        data = ex.buckets(18, 600, now)
+        top = max(max(data), 0.5)
+        bw = W / len(data)
+        base = H - 20
+        c.create_line(0, base, W, base, fill=LINE)
+        for i, v in enumerate(data):
+            h = (base - 22) * v / top
+            x0 = i * bw + 3
+            if v > 0:
+                c.create_rectangle(x0, base - h, x0 + bw - 6, base, fill=ACCENT, outline="")
+                c.create_text(x0 + (bw - 6) / 2, base - h - 7, text=f"{v:.1f}", fill=MUTED, font=F_MONO)
+            if i % 3 == 0:
+                t = now - (len(data) - i) * 600
+                c.create_text(x0, H - 8, text=time.strftime("%H:%M", time.localtime(t)), fill=MUTED, font=F_MONO, anchor="w")
 
     def open_path(self, path):
         try:
@@ -467,10 +638,12 @@ class App(tk.Tk):
     # ------------------------------------------------------------ acciones
     def show(self, key):
         self.current_page = key
-        {"main": self.page_main, "net": self.page_net, "cfg": self.page_cfg}[key].tkraise()
+        {"main": self.page_main, "net": self.page_net, "exp": self.page_exp, "cfg": self.page_cfg}[key].tkraise()
         if key == "net":
             self._net_sig = None
             self.after(50, self.paint_net)
+        elif key == "exp":
+            self.after(50, self.paint_exp)
         for k, lb in self.nav.items():
             lb.config(bg=PANEL2 if k == key else PANEL, fg=ACCENT if k == key else FG)
 
@@ -580,7 +753,8 @@ class App(tk.Tk):
         try:
             while True:
                 t, msg, lvl = self.q.get_nowait()
-                if msg.startswith(("de vuelta en el mundo", "Angel Baby activado", "Internet: volvió")) or "no avanza" in msg:
+                if (msg.startswith(("de vuelta en el mundo", "Angel Baby activado", "Internet: volvió", "Sin ganar experiencia",
+                                    "¡Subiste de nivel", "Bajó la experiencia", "Entré a", "El servidor no responde")) or "no avanza" in msg):
                     self.notify("AutoRelog", msg)
                 self.log.config(state="normal")
                 tag = "err" if lvl >= logging.ERROR else "warn" if lvl >= logging.WARNING else ""

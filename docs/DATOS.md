@@ -76,6 +76,22 @@ Las columnas de latencia quedan vacías si no hubo ninguna prueba exitosa en ese
 
 `caida_juego` = apareció el cartel de conexión interrumpida. `reingreso` = el juego volvió al mundo; `dur` es el tiempo desde el cartel.
 
+### `exp.csv` — lecturas de experiencia
+
+```
+t,pct,ganancia,tipo
+1791670712.0,97.46,0.0,hb
+1791670722.3,97.55,0.09,gain
+```
+
+| Campo | Significado |
+|---|---|
+| `pct` | Porcentaje de la barra de nivel (0–99.99). |
+| `ganancia` | Experiencia ganada (o perdida, si es negativa) respecto de la lectura anterior, en puntos porcentuales. |
+| `tipo` | `gain` ganó · `lvl` subió de nivel · `loss` perdió (p. ej. murió) · `hb` latido sin cambios (cada 60 s, para medir el tiempo activo). |
+
+Solo se escribe cuando la experiencia cambia, más un latido por minuto. Ver [EXPERIENCIA.md](EXPERIENCIA.md).
+
 ### `estado.json`
 
 ```json

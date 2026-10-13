@@ -20,6 +20,8 @@ La configuración vive en `config.json`, junto al código. No viene en el reposi
 | `dismiss_trade_pin` | `true` | Cerrar con ✘ el aviso "¿Quieres poner un Trade PIN?". |
 | `max_attempts` | `8` | Veces que se acciona una misma pantalla en 60 s antes de pausar 60 s. |
 | `threshold` | `0.8` | Umbral de coincidencia de las plantillas (0–1). |
+| `server_early_probe` | `1.0` | Segundos tras clickear *Start* antes de comprobar si la pantalla cambió. Si sigue idéntica, el click se perdió y se reintenta sin esperar `MIN_REPEAT`. Para reintentos subsecuentes escala al método de click. |
+| `server_early_retry` | `false` | Reintentar *Start* apenas la pantalla sigue idéntica (**experimental**: si el servidor tarda con la pantalla quieta, hace clicks de más). Con `false` solo **mide** y deja en el registro la línea `Start: diferencia máxima…` para calibrar. |
 
 ### Tiempos
 
@@ -37,12 +39,27 @@ La configuración vive en `config.json`, junto al código. No viene en el reposi
 | `angel_baby_after_relog` | `true` | Tras reloguear: `Ctrl+R` y tildar *Attack*. |
 | `ab_close_panel` | `true` | Cerrar el panel al terminar. |
 
+### Capturas
+
+| Clave | Por defecto | Descripción |
+|---|---|---|
+| `capture_unknown` | `true` | Guardar en `capturas/` las pantallas del login no reconocidas, para armar plantillas de un estilo nuevo. |
+
+### Experiencia
+
+| Clave | Por defecto | Descripción |
+|---|---|---|
+| `exp_tracking` | `true` | Leer el % de experiencia del HUD cada ~10 s (con el juego visible y en el mundo). |
+| `exp_stall_min` | `10` | Avisar si pasan estos minutos sin ganar experiencia (`0` = nunca). |
+
 ### Juego minimizado
 
 | Clave | Por defecto | Descripción |
 |---|---|---|
 | `restore_minimized` | `true` | Restaurarlo (sin foco) cuando haga falta revisarlo y volver a minimizarlo. |
 | `peek_min_outage` | `3` | Segundos de corte de internet a partir de los cuales se revisa el juego al volver la conexión. |
+| `peek_during_outage_s` | `45` | Si el internet lleva tantos segundos caído y el juego está minimizado, restaurarlo ya para ver el cartel y reloguear apenas vuelva (`0` = no). |
+| `peek_dwell_s` | `45` | Tras un corte, cuánto se queda restaurado mirando antes de volver a minimizarlo. |
 | `peek_every_min` | `10` | Revisión periódica si sigue minimizado (`0` = nunca). |
 
 ### Aplicación

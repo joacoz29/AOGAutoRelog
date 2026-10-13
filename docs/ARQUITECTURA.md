@@ -11,6 +11,7 @@ flowchart LR
         GUI["gui.py<br/>Interfaz tkinter<br/>(hilo principal)"]
         ENG["autorelog.py<br/>Motor Relog<br/>(hilo worker)"]
         NET["netmon.py<br/>NetMonitor<br/>(hilo propio)"]
+    EXP["expmon.py<br/>lector y estadisticas<br/>de experiencia"]
         TRY["tray.py<br/>Icono de bandeja<br/>(hilo propio)"]
     end
 
@@ -37,6 +38,9 @@ flowchart LR
     NET -- "ping durante un corte" --> ROUTER
     NET -- "escribe" --> DATA
     ENG -- "caida_juego / reingreso" --> DATA
+    ENG -- "captura en color cada ~10 s" --> EXP
+    EXP -- "exp.csv" --> DATA
+    GUI -- "ritmo y gráficos" --> EXP
     GUI -- "estadisticas y exportar" --> DATA
     GUI --> REP
     GUI -- "lee / guarda" --> CFG
@@ -50,9 +54,10 @@ flowchart LR
 | `autorelog.py` | Encontrar la ventana, capturarla, reconocer pantallas por plantillas, decidir qué hacer y ejecutar clicks/teclas. Contiene la clase `Relog` (máquina de estados). | Conocer tkinter. Funciona también por consola (`autorelog.py --live`). |
 | `gui.py` | Interfaz, ajustes, pestaña de conexión, ciclo de vida de los hilos, bandeja, instancia única. | Hacer clicks al juego directamente (siempre pasa por `Relog`). |
 | `netmon.py` | Medir internet, detectar cortes, guardar datos, calcular estadísticas y generar informes. | Saber del juego, salvo registrar eventos que le pasa el motor. |
+| `expmon.py` | Leer el porcentaje de experiencia de una captura y calcular ritmo, ETA, subidas de nivel y estancamiento. No sabe de ventanas ni de clicks. | Capturar la pantalla: recibe una imagen. |
 | `tray.py` | Icono en los iconos ocultos, menú, globos de notificación. Solo `pywin32`. | Tener lógica de negocio: solo emite eventos (`open`, `toggle`, `exit`). |
 
-El acoplamiento es deliberadamente unidireccional: `gui` conoce a los otros tres, `autorelog` solo importa `netmon` (para registrar eventos del juego), y `netmon`/`tray` no importan a nadie.
+El acoplamiento es deliberadamente unidireccional: `gui` conoce a los demás, `autorelog` solo importa `netmon` (eventos del juego) y `expmon` (lectura de experiencia), y `netmon`/`expmon`/`tray` no importan a ningún otro módulo del proyecto.
 
 ## Hilos
 
@@ -124,7 +129,8 @@ Más detalle en [FUNCIONAMIENTO.md](FUNCIONAMIENTO.md).
 | **Dejar al juego "despierto" durante toda una secuencia** y dormirlo recién al terminar | Dormirlo justo después de cada entrada hacía que descartara la tecla (la lee en su siguiente cuadro). |
 | **Pulsaciones largas** (tecla 0.3 s, click 0.1 s ampliable a 0.4 s) | El juego lee la entrada por cuadro; una pulsación corta puede caer entre dos cuadros y perderse. |
 | **Estacionar el cursor** del juego en `PARK = (900, 30)` tras cada click | El juego dibuja su cursor donde le mandamos el último movimiento: tapaba las plantillas y dejaba botones en estado *hover*, que bajaba la coincidencia. |
-| **Escalar el método de click** si un paso se repite | Si el segundo plano falla en una pantalla concreta, ese click usa el mouse real sin degradar el resto. |
+| **Click largo desde el primer intento** en carteles y login, y escalar si un paso se repite | El click corto nunca registraba ahí (el registro lo mostró en cada relog). Si el segundo plano falla igualmente, ese click usa el mouse real sin degradar el resto. |
+| **Verificar visualmente la fila del canal** antes de aceptar | Un click perdido dejaba elegido el canal por defecto (el 1, a menudo lleno) y el relog terminaba en el canal equivocado. |
 | **Monitor de internet independiente del juego** | Debe medir aunque la vigilancia esté detenida y servir como evidencia por sí solo. |
 | **Tres servidores y 2 fallas seguidas** para declarar un corte | Evita falsos cortes por un servidor caído o una pérdida de un solo paquete. |
 | **Escritura atómica** de `config.json` y `estado.json`, más copia `.bak` | Un corte de luz a mitad de escritura dejaba un JSON roto y el programa no arrancaba. |
